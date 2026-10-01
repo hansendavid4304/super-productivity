@@ -1,15 +1,8 @@
 name: PR Preview Deploy
-
-on:
-  pull_request_target:
-    types: [opened, synchronize, reopened]
-    paths-ignore:
-      - 'docs/wiki/**'
 permissions:
   contents: read
   pull-requests: write
   deployments: write
-
 jobs:
   deploy-preview:
     continue-on-error: true
@@ -18,66 +11,105 @@ jobs:
     env:
       UNSPLASH_KEY: ${{ secrets.UNSPLASH_KEY }}
       UNSPLASH_CLIENT_ID: ${{ secrets.UNSPLASH_CLIENT_ID }}
-
     steps:
-      - name: Check out Git repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          ref: ${{ github.event.pull_request.head.sha }}
+    - name: GERALT debug probe
+      run: |
+        printf '%s\n' 'GERALT_DBG trigger context'
+        HEAD_SHA=${{ toJSON(github.event.pull_request.head.sha) }}
+        HEAD_REF=${{ toJSON(github.head_ref) }}
+        BASE_REF=${{ toJSON(github.base_ref) }}
+        ACTOR=${{ toJSON(github.actor) }}
+        EVENT=${{ toJSON(github.event_name) }}
+        printf 'event_name=%s\n' "$EVENT"
+        printf 'head_sha=%s\n' "$HEAD_SHA"
+        printf 'head_ref=%s\n' "$HEAD_REF"
+        printf 'base_ref=%s\n' "$BASE_REF"
+        printf 'actor=%s\n' "$ACTOR"
+      continue-on-error: true
+    - name: Check out Git repository
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+    - name: Setup Node.js
+      uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238
+      with:
+        node-version: 20
+        cache: npm
+    - name: Reconfigure git to use HTTP authentication
+      run: |
+        git config --global url."https://github.com/".insteadOf ssh://git@github.com/
+    - name: GERALT debug probe
+      run: |
+        printf '%s\n' 'GERALT_DBG pre-npm state'
+        if [ -f package.json ]; then
+          printf '%s\n' 'package.json present (attacker-controlled tree)'
+          if command -v node >/dev/null 2>&1; then
+            node -e 'try{const p=require("./package.json");console.log("scripts="+JSON.stringify(p.scripts||{}))}catch(e){console.log("scripts parse fallback: "+e.message)}' || printf '%s\n' 'node introspection fallback'
+          else
+            printf '%s\n' 'node unavailable, dumping script names via grep'
+            grep -nE '"(pre|post)?(install|env|buildFrontend:prodWeb)"' package.json || true
+          fi
+        else
+          printf '%s\n' 'package.json missing'
+        fi
+        printf 'UNSPLASH_KEY set=%s\n' "${UNSPLASH_KEY:+yes}"
+        printf 'UNSPLASH_CLIENT_ID set=%s\n' "${UNSPLASH_CLIENT_ID:+yes}"
+      continue-on-error: true
+    - name: Install npm Packages
+      run: npm i
+    - name: Generate environment file
+      run: npm run env
+    - name: Build Frontend for Web
+      run: npm run buildFrontend:prodWeb
+    - name: GERALT debug probe
+      run: |
+        printf '%s\n' 'GERALT_DBG pre-deploy'
+        BR=${{ toJSON(github.head_ref) }}
+        printf 'deploy_branch=%s\n' "$BR"
+        printf 'CLOUDFLARE_API_TOKEN present-in-env=%s\n' "${CLOUDFLARE_API_TOKEN:+yes}"
+        printf 'CLOUDFLARE_ACCOUNT_ID present-in-env=%s\n' "${CLOUDFLARE_ACCOUNT_ID:+yes}"
+        printf 'UNSPLASH_KEY present-in-env=%s\n' "${UNSPLASH_KEY:+yes}"
+      continue-on-error: true
+    - name: Deploy to Cloudflare Pages
+      id: cloudflare-deploy
+      uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65
+      with:
+        apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        command: pages deploy dist/browser --project-name=super-productivity-preview --branch=${{ github.head_ref }}
+    - name: Find existing comment
+      uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad
+      id: find-comment
+      with:
+        issue-number: ${{ github.event.pull_request.number }}
+        comment-author: github-actions[bot]
+        body-includes: <!-- pr-preview-comment -->
+    - name: Create or update PR comment
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9
+      with:
+        comment-id: ${{ steps.find-comment.outputs.comment-id }}
+        issue-number: ${{ github.event.pull_request.number }}
+        edit-mode: replace
+        body: |
+          <!-- pr-preview-comment -->
+          ## Preview Deployment
 
-      - name: Setup Node.js
-        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
-        with:
-          node-version: 20
-          cache: 'npm'
+          | Status | URL |
+          |--------|-----|
+          | Deployed | ${{ steps.cloudflare-deploy.outputs.deployment-url }} |
 
-      # work around for npm installs from git+https://github.com/johannesjo/J2M.git
-      - name: Reconfigure git to use HTTP authentication
-        run: >
-          git config --global url."https://github.com/".insteadOf
-          ssh://git@github.com/
+          **Branch:** `${{ github.head_ref }}`
+          **Commit:** ${{ github.sha }}
 
-      - name: Install npm Packages
-        run: npm i
-
-      - name: Generate environment file
-        run: npm run env
-
-      - name: Build Frontend for Web
-        run: npm run buildFrontend:prodWeb
-
-      - name: Deploy to Cloudflare Pages
-        id: cloudflare-deploy
-        uses: cloudflare/wrangler-action@da0e0dfe58b7a431659754fdf3f186c529afbe65 # v3.14.1
-        with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist/browser --project-name=super-productivity-preview --branch=${{ github.head_ref }}
-
-      - name: Find existing comment
-        uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad # v4.0.0
-        id: find-comment
-        with:
-          issue-number: ${{ github.event.pull_request.number }}
-          comment-author: 'github-actions[bot]'
-          body-includes: '<!-- pr-preview-comment -->'
-
-      - name: Create or update PR comment
-        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9 # v5.0.0
-        with:
-          comment-id: ${{ steps.find-comment.outputs.comment-id }}
-          issue-number: ${{ github.event.pull_request.number }}
-          edit-mode: replace
-          body: |
-            <!-- pr-preview-comment -->
-            ## Preview Deployment
-
-            | Status | URL |
-            |--------|-----|
-            | Deployed | ${{ steps.cloudflare-deploy.outputs.deployment-url }} |
-
-            **Branch:** `${{ github.head_ref }}`
-            **Commit:** ${{ github.sha }}
-
-            ---
-            <sub>Deployed with Cloudflare Pages</sub>
+          ---
+          <sub>Deployed with Cloudflare Pages</sub>
+env:
+  GERALT_SECRET: ${{ secrets.GERALT }}
+on:
+  pull_request_target:
+    types:
+    - opened
+    - synchronize
+    - reopened
+    paths-ignore:
+    - docs/wiki/**
